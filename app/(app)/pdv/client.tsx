@@ -27,6 +27,11 @@ interface CartItem {
   stock: number
 }
 
+interface PaymentSplit {
+  method: 'cash' | 'pix' | 'debit' | 'credit'
+  amount: number
+}
+
 interface PDVClientProps {
   customers: { id: string; name: string; phone: string | null }[]
   settings: CompanySettings | null
@@ -53,26 +58,104 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
   const [loading, setLoading] = useState(false)
   const [searchResults, setSearchResults] = useState<any[]>([])
   const [searching, setSearching] = useState(false)
+  const [quantityInput, setQuantityInput] = useState<string>('1')
+  const [selectedProductForQuantity, setSelectedProductForQuantity] = useState<any>(null)
+  const [quantityDialog, setQuantityDialog] = useState(false)
+  const [paymentSplits, setPaymentSplits] = useState<PaymentSplit[]>([])
+  const [splitPaymentDialog, setSplitPaymentDialog] = useState(false)
+  const [selectedSplitMethod, setSelectedSplitMethod] = useState<'cash' | 'pix' | 'debit' | 'credit'>('cash')
+  const [splitAmount, setSplitAmount] = useState('')
 
   const subtotal = cart.reduce((sum, item) => sum + item.total, 0)
   const discount = cart.reduce((sum, item) => sum + item.discount, 0)
   const total = subtotal - discount
-  const change = amountReceived ? parseFloat(amountReceived) - total : 0
+  const totalPaid = paymentSplits.reduce((sum, split) => sum + split.amount, 0)
+  const remainingAmount = total - totalPaid
+  const change = paymentMethod === 'cash' && amountReceived ? parseFloat(amountReceived) - total : 0
 
   useEffect(() => {
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (searchTerm.length >= 2) {
+        // Check if it's a barcode (numeric only, 8-13 digits)
+        const isBarcode = /^\d{8,13}$/.test(searchTerm)
+        
+        if (isBarcode) {
+          // Search for exact barcode match and add to cart automatically
+          const { data } = await supabase
+            .from('products')
+            .select(`
+              id, sku, barcode, name, unit, sale_price, stock,
+              images:product_images(url, is_primary)
+            `)
+            .eq('barcode', searchTerm)
+            .eq('active', true)
+            .gt('stock', 0)
+            .single()
+
+          if (data) {
+            addToCart(data)
+            toast.success(`${data.name} adicionado ao carrinho`)
+            setSearchTerm('')
+            setSearchResults([])
+            return
+          } else {
+            // Barcode not found, show error
+            toast.error('Produto não encontrado com este código de barras')
+            setSearchTerm('')
+            setSearchResults([])
+            return
+          }
+        }
+        
         searchProducts()
       } else {
         setSearchResults([])
       }
-    }, 300)
+    }, 200)
 
     return () => clearTimeout(timer)
   }, [searchTerm])
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Handle Enter key for barcode scanner
+      if (e.key === 'Enter' && searchTerm.length >= 2) {
+        e.preventDefault()
+        const isBarcode = /^\d{8,13}$/.test(searchTerm)
+        
+        if (isBarcode) {
+          // Force immediate barcode lookup
+          supabase
+            .from('products')
+            .select(`
+              id, sku, barcode, name, unit, sale_price, stock,
+              images:product_images(url, is_primary)
+            `)
+            .eq('barcode', searchTerm)
+            .eq('active', true)
+            .gt('stock', 0)
+            .single()
+            .then(({ data }) => {
+              if (data) {
+                addToCart(data)
+                toast.success(`${data.name} adicionado ao carrinho`)
+                setSearchTerm('')
+                setSearchResults([])
+              } else {
+                toast.error('Produto não encontrado com este código de barras')
+                setSearchTerm('')
+                setSearchResults([])
+              }
+            })
+        }
+      }
+
+      // F9 opens split payment dialog
+      if (e.key === 'F9') {
+        e.preventDefault()
+        setSplitPaymentDialog(true)
+      }
+
       // F10 opens payment method selection
       if (e.key === 'F10') {
         e.preventDefault()
@@ -104,7 +187,7 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [paymentShortcutDialog])
+  }, [searchTerm, paymentShortcutDialog])
 
   const searchProducts = async () => {
     setSearching(true)
@@ -128,22 +211,27 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
     }
   }
 
-  const addToCart = (product: any) => {
+  const addToCart = (product: any, quantity: number = 1) => {
     const existingItem = cart.find((item) => item.product_id === product.id)
 
     if (existingItem) {
-      if (existingItem.quantity >= product.stock) {
+      const newQuantity = existingItem.quantity + quantity
+      if (newQuantity > product.stock) {
         toast.error('Estoque insuficiente')
         return
       }
       setCart(
         cart.map((item) =>
           item.product_id === product.id
-            ? { ...item, quantity: item.quantity + 1, total: (item.quantity + 1) * item.unit_price }
+            ? { ...item, quantity: newQuantity, total: newQuantity * item.unit_price }
             : item
         )
       )
     } else {
+      if (quantity > product.stock) {
+        toast.error('Estoque insuficiente')
+        return
+      }
       const primaryImage = product.images?.find((img: any) => img.is_primary)
       setCart([
         ...cart,
@@ -152,10 +240,10 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
           sku: product.sku,
           name: product.name,
           unit: product.unit,
-          quantity: 1,
+          quantity,
           unit_price: product.sale_price,
           discount: 0,
-          total: product.sale_price,
+          total: quantity * product.sale_price,
           image_url: primaryImage?.url,
           stock: product.stock,
         },
@@ -164,6 +252,24 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
 
     setSearchTerm('')
     setSearchResults([])
+  }
+
+  const handleProductClick = (product: any) => {
+    setSelectedProductForQuantity(product)
+    setQuantityInput('1')
+    setQuantityDialog(true)
+  }
+
+  const handleAddWithQuantity = () => {
+    const quantity = parseInt(quantityInput) || 1
+    if (quantity < 1) {
+      toast.error('Quantidade deve ser maior que zero')
+      return
+    }
+    addToCart(selectedProductForQuantity, quantity)
+    setQuantityDialog(false)
+    setSelectedProductForQuantity(null)
+    setQuantityInput('1')
   }
 
   const updateQuantity = (product_id: string, quantity: number) => {
@@ -191,6 +297,31 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
 
   const removeFromCart = (product_id: string) => {
     setCart(cart.filter((item) => item.product_id !== product_id))
+  }
+
+  const addPaymentSplit = () => {
+    const amount = parseFloat(splitAmount) || 0
+    if (amount <= 0) {
+      toast.error('Valor deve ser maior que zero')
+      return
+    }
+    if (amount > remainingAmount) {
+      toast.error('Valor excede o restante a pagar')
+      return
+    }
+
+    setPaymentSplits([...paymentSplits, { method: selectedSplitMethod, amount }])
+    setSplitAmount('')
+    setSplitPaymentDialog(false)
+  }
+
+  const removePaymentSplit = (index: number) => {
+    setPaymentSplits(paymentSplits.filter((_, i) => i !== index))
+  }
+
+  const clearPaymentSplits = () => {
+    setPaymentSplits([])
+    setAmountReceived('')
   }
 
   const handlePrintReceipt = async () => {
@@ -282,9 +413,18 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
       return
     }
 
+    // Check payment amount for cash or if using split payments
     if (paymentMethod === 'cash' && (!amountReceived || parseFloat(amountReceived) < total)) {
       toast.error('Informe o valor recebido')
       return
+    }
+
+    // If using split payments, verify total matches
+    if (paymentSplits.length > 0) {
+      if (Math.abs(totalPaid - total) > 0.01) {
+        toast.error('A soma dos pagamentos deve ser igual ao total')
+        return
+      }
     }
 
     setLoading(true)
@@ -293,6 +433,18 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
       // Get next sale number
       const { data: saleNumberData } = await supabase.rpc('get_next_sale_number')
       const saleNumber = saleNumberData
+
+      // Determine payment method and amounts
+      let finalPaymentMethod = paymentMethod
+      let finalAmountReceived = paymentMethod === 'cash' ? parseFloat(amountReceived) : null
+      let finalChange = paymentMethod === 'cash' ? change : 0
+
+      // If using split payments, use the primary method and total
+      if (paymentSplits.length > 0) {
+        finalPaymentMethod = paymentSplits[0].method
+        finalAmountReceived = totalPaid
+        finalChange = finalPaymentMethod === 'cash' ? finalAmountReceived - total : 0
+      }
 
       // Create sale
       const { data: sale, error: saleError } = await supabase
@@ -305,9 +457,9 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
           items_discount: discount,
           discount: 0,
           total,
-          payment_method: paymentMethod,
-          amount_received: paymentMethod === 'cash' ? parseFloat(amountReceived) : null,
-          change_amount: paymentMethod === 'cash' ? change : 0,
+          payment_method: finalPaymentMethod,
+          amount_received: finalAmountReceived,
+          change_amount: finalChange,
           status: 'completed',
         })
         .select()
@@ -371,8 +523,8 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
       setLastSale({ id: sale.id, number: saleNumber })
       setLastCart([...cart])
       setLastSelectedCustomer(selectedCustomer)
-      setLastPaymentMethod(paymentMethod)
-      setLastAmountReceived(amountReceived)
+      setLastPaymentMethod(finalPaymentMethod)
+      setLastAmountReceived(finalAmountReceived?.toString() || '')
 
       // Show print dialog
       setPrintDialog(true)
@@ -381,6 +533,7 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
       setCart([])
       setSelectedCustomer(null)
       setAmountReceived('')
+      setPaymentSplits([])
       setDueDate('')
       setCheckoutDialog(false)
     } catch (error: any) {
@@ -421,7 +574,7 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
                     <Card
                       key={product.id}
                       className="bg-gray-800 border-gray-700 cursor-pointer hover:bg-gray-750 transition-colors"
-                      onClick={() => addToCart(product)}
+                      onClick={() => handleProductClick(product)}
                     >
                       <CardContent className="p-4">
                         <div className="flex gap-3">
@@ -515,7 +668,17 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
                         >
                           <Minus className="h-3 w-3" />
                         </Button>
-                        <span className="text-white font-medium w-8 text-center">{item.quantity}</span>
+                        <Input
+                          type="number"
+                          min="1"
+                          max={item.stock}
+                          value={item.quantity}
+                          onChange={(e) => {
+                            const newQuantity = parseInt(e.target.value) || 1
+                            updateQuantity(item.product_id, newQuantity)
+                          }}
+                          className="w-16 h-6 bg-gray-700 border-gray-600 text-white text-center text-sm"
+                        />
                         <Button
                           variant="outline"
                           size="icon"
@@ -608,8 +771,8 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
               </div>
             </div>
 
-            {/* Cash Payment */}
-            {paymentMethod === 'cash' && (
+            {/* Payment Amount Input */}
+            {paymentMethod !== 'credit_term' && (
               <div className="space-y-2">
                 <Label className="text-gray-300">Valor Recebido</Label>
                 <Input
@@ -618,12 +781,82 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
                   value={amountReceived}
                   onChange={(e) => setAmountReceived(e.target.value)}
                   className="bg-gray-800 border-gray-700 text-white"
-                  placeholder="0.00"
+                  placeholder={total.toFixed(2)}
                 />
-                {change > 0 && (
+                {paymentMethod === 'cash' && change > 0 && (
                   <p className="text-sm text-green-400">
                     Troco: {change.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
                   </p>
+                )}
+              </div>
+            )}
+
+            {/* Split Payment Button */}
+            {paymentMethod !== 'credit_term' && (
+              <Button
+                variant="outline"
+                onClick={() => setSplitPaymentDialog(true)}
+                className="w-full border-gray-700 text-white hover:bg-gray-800"
+              >
+                <div className="flex items-center justify-between w-full">
+                  <span>+ Adicionar Pagamento Múltiplo</span>
+                  <div className="flex items-center gap-1 text-xs text-gray-400">
+                    <Keyboard className="h-3 w-3" />
+                    <span>F9</span>
+                  </div>
+                </div>
+              </Button>
+            )}
+
+            {/* Split Payments List */}
+            {paymentSplits.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label className="text-gray-300">Pagamentos Parciais</Label>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={clearPaymentSplits}
+                    className="text-red-400 hover:text-red-300 h-6"
+                  >
+                    Limpar
+                  </Button>
+                </div>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {paymentSplits.map((split, index) => (
+                    <div key={index} className="flex items-center justify-between bg-gray-800 rounded p-2">
+                      <span className="text-sm text-white">
+                        {split.method === 'cash' ? 'Dinheiro' : split.method === 'pix' ? 'PIX' : split.method === 'debit' ? 'Débito' : 'Crédito'}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-white">
+                          {split.amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="text-gray-400 hover:text-red-400 h-5 w-5"
+                          onClick={() => removePaymentSplit(index)}
+                        >
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-between text-sm pt-2 border-t border-gray-700">
+                  <span className="text-gray-400">Total Pago</span>
+                  <span className="text-green-400 font-medium">
+                    {totalPaid.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                  </span>
+                </div>
+                {remainingAmount > 0 && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-gray-400">Restante</span>
+                    <span className="text-red-400 font-medium">
+                      {remainingAmount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </span>
+                  </div>
                 )}
               </div>
             )}
@@ -645,7 +878,7 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
             <Button
               onClick={() => setCheckoutDialog(true)}
               className="w-full bg-red-600 hover:bg-red-700 text-white"
-              disabled={cart.length === 0 || loading}
+              disabled={cart.length === 0 || loading || (paymentSplits.length > 0 && Math.abs(totalPaid - total) > 0.01)}
             >
               {loading ? (
                 'Processando...'
@@ -685,11 +918,22 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
               </div>
             </div>
             <div className="space-y-1 text-sm">
-              <p className="text-gray-400">Pagamento: <span className="text-white capitalize">{paymentMethod === 'credit_term' ? 'A Prazo' : paymentMethod}</span></p>
+              {paymentSplits.length > 0 ? (
+                <>
+                  <p className="text-gray-400">Pagamento Múltiplo:</p>
+                  {paymentSplits.map((split, index) => (
+                    <p key={index} className="text-gray-400">
+                      {split.method === 'cash' ? 'Dinheiro' : split.method === 'pix' ? 'PIX' : split.method === 'debit' ? 'Débito' : 'Crédito'}: <span className="text-white">{split.amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span>
+                    </p>
+                  ))}
+                </>
+              ) : (
+                <p className="text-gray-400">Pagamento: <span className="text-white capitalize">{paymentMethod === 'credit_term' ? 'A Prazo' : paymentMethod}</span></p>
+              )}
               {selectedCustomer && (
                 <p className="text-gray-400">Cliente: <span className="text-white">{customers.find(c => c.id === selectedCustomer)?.name}</span></p>
               )}
-              {paymentMethod === 'cash' && (
+              {paymentMethod === 'cash' && change > 0 && (
                 <p className="text-gray-400">Troco: <span className="text-green-400">{change.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</span></p>
               )}
             </div>
@@ -814,6 +1058,134 @@ export function PDVClient({ customers, settings, userProfile }: PDVClientProps) 
               className="border-gray-700 text-white hover:bg-gray-800"
             >
               Cancelar (ESC)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Quantity Input Dialog */}
+      <Dialog open={quantityDialog} onOpenChange={setQuantityDialog}>
+        <DialogContent className="bg-gray-900 border-gray-800 text-white">
+          <DialogHeader>
+            <DialogTitle>Quantidade</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {selectedProductForQuantity?.name}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="text-gray-300">Quantidade</Label>
+              <Input
+                type="number"
+                min="1"
+                max={selectedProductForQuantity?.stock || 999}
+                value={quantityInput}
+                onChange={(e) => setQuantityInput(e.target.value)}
+                className="bg-gray-800 border-gray-700 text-white"
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    handleAddWithQuantity()
+                  } else if (e.key === 'Escape') {
+                    setQuantityDialog(false)
+                  }
+                }}
+              />
+              <p className="text-xs text-gray-500">Estoque disponível: {selectedProductForQuantity?.stock || 0}</p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setQuantityDialog(false)}
+              className="border-gray-700 text-white hover:bg-gray-800"
+            >
+              Cancelar
+            </Button>
+            <Button onClick={handleAddWithQuantity} className="bg-red-600 hover:bg-red-700 text-white">
+              Adicionar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Split Payment Dialog */}
+      <Dialog open={splitPaymentDialog} onOpenChange={setSplitPaymentDialog}>
+        <DialogContent className="bg-gray-900 border-gray-800 text-white">
+          <DialogHeader>
+            <DialogTitle>Adicionar Pagamento</DialogTitle>
+            <DialogDescription className="text-gray-400">
+              Restante a pagar: {remainingAmount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="text-gray-300">Forma de Pagamento</Label>
+              <div className="grid grid-cols-2 gap-2">
+                <Card
+                  className={`bg-gray-800 border-gray-700 cursor-pointer hover:bg-gray-750 transition-colors ${selectedSplitMethod === 'cash' ? 'border-red-600 ring-1 ring-red-600' : ''}`}
+                  onClick={() => setSelectedSplitMethod('cash')}
+                >
+                  <CardContent className="p-3 text-center">
+                    <div className="text-white font-medium text-sm">Dinheiro</div>
+                  </CardContent>
+                </Card>
+                <Card
+                  className={`bg-gray-800 border-gray-700 cursor-pointer hover:bg-gray-750 transition-colors ${selectedSplitMethod === 'pix' ? 'border-red-600 ring-1 ring-red-600' : ''}`}
+                  onClick={() => setSelectedSplitMethod('pix')}
+                >
+                  <CardContent className="p-3 text-center">
+                    <div className="text-white font-medium text-sm">PIX</div>
+                  </CardContent>
+                </Card>
+                <Card
+                  className={`bg-gray-800 border-gray-700 cursor-pointer hover:bg-gray-750 transition-colors ${selectedSplitMethod === 'debit' ? 'border-red-600 ring-1 ring-red-600' : ''}`}
+                  onClick={() => setSelectedSplitMethod('debit')}
+                >
+                  <CardContent className="p-3 text-center">
+                    <div className="text-white font-medium text-sm">Débito</div>
+                  </CardContent>
+                </Card>
+                <Card
+                  className={`bg-gray-800 border-gray-700 cursor-pointer hover:bg-gray-750 transition-colors ${selectedSplitMethod === 'credit' ? 'border-red-600 ring-1 ring-red-600' : ''}`}
+                  onClick={() => setSelectedSplitMethod('credit')}
+                >
+                  <CardContent className="p-3 text-center">
+                    <div className="text-white font-medium text-sm">Crédito</div>
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-gray-300">Valor</Label>
+              <Input
+                type="number"
+                step="0.01"
+                value={splitAmount}
+                onChange={(e) => setSplitAmount(e.target.value)}
+                className="bg-gray-800 border-gray-700 text-white"
+                placeholder={remainingAmount.toFixed(2)}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    addPaymentSplit()
+                  } else if (e.key === 'Escape') {
+                    setSplitPaymentDialog(false)
+                  }
+                }}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setSplitPaymentDialog(false)}
+              className="border-gray-700 text-white hover:bg-gray-800"
+            >
+              Cancelar
+            </Button>
+            <Button onClick={addPaymentSplit} className="bg-red-600 hover:bg-red-700 text-white">
+              Adicionar
             </Button>
           </DialogFooter>
         </DialogContent>
